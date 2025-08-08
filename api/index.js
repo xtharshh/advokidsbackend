@@ -51,21 +51,39 @@ function authenticateToken(req, res, next) {
 // Routes
 
 // Register
+// Register route with connection check
 app.post('/api/register', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ message: 'Missing email or password' });
+    // Check if database is connected
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(500).json({ 
+        message: 'Database connection unavailable' 
+      });
+    }
 
-    let exist = await User.findOne({ email });
-    if (exist) return res.status(400).json({ message: 'User already exists' });
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Missing email or password' });
+    }
+
+    // Set a timeout for the database operation
+    const existingUser = await User.findOne({ email }).maxTimeMS(5000);
+    if (existingUser) {
+      return res.status(400).json({ message: 'User already exists' });
+    }
 
     const hash = await bcrypt.hash(password, 10);
     const user = await User.create({ email, password: hash });
     const token = jwt.sign({ id: user._id, email }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    
     res.json({ token, message: 'User registered successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Register error:', error);
+    if (error.name === 'MongoTimeoutError') {
+      res.status(500).json({ message: 'Database operation timed out' });
+    } else {
+      res.status(500).json({ message: 'Server error', error: error.message });
+    }
   }
 });
 
