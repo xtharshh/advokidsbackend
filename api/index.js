@@ -2,43 +2,66 @@ require('dotenv').config();
 
 const express = require('express');
 const mongoose = require('mongoose');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-
-// Import User model
 const User = require('../models/model');
 
 const app = express();
-app.use(cors({
-  origin: '*', // For development only
-  credentials: true
-}));
-app.use(bodyParser.json());
+app.use(express.json());
+app.use(require('cors')({ origin: '*' }));
 
-// Enhanced MongoDB connection
+// Enhanced MongoDB connection function
 async function connectToMongoDB() {
   try {
     await mongoose.connect(process.env.MONGODB_URI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      bufferCommands: false,           // Disable buffering to get immediate errors
-      serverSelectionTimeoutMS: 5000, // Reduce timeout to 5 seconds
-      socketTimeoutMS: 45000,          // Socket timeout
-      maxPoolSize: 10,                 // Maintain up to 10 socket connections
-      connectTimeoutMS: 10000,         // Give up initial connection after 10 seconds
-      family: 4                        // Use IPv4, skip trying IPv6
+      
+      // Connection timeout settings
+      serverSelectionTimeoutMS: 5000,    // How long to try selecting a server
+      connectTimeoutMS: 10000,           // How long to wait for initial connection
+      socketTimeoutMS: 45000,            // How long a socket stays open
+      
+      // Buffer settings
+      bufferCommands: false,             // Disable buffering
+      bufferMaxEntries: 0,               // Disable mongoose buffering
+      
+      // Connection pool settings
+      maxPoolSize: 10,                   // Maximum connections
+      minPoolSize: 1,                    // Minimum connections
+      
+      // Retry settings
+      retryWrites: true,                 // Retry failed writes
+      family: 4                          // Use IPv4, skip IPv6
     });
+    
     console.log('✅ MongoDB Connected Successfully!');
   } catch (error) {
-    console.error('❌ MongoDB Connection Error:', error.message);
+    console.error('❌ MongoDB Connection Failed:', error.message);
+    
+    // Auto-retry connection after 5 seconds
     console.log('🔄 Retrying connection in 5 seconds...');
     setTimeout(connectToMongoDB, 5000);
   }
 }
 
-// Connect before starting server
+// Enhanced connection event handlers
+mongoose.connection.on('connected', () => {
+  console.log('✅ Mongoose connected to MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('❌ Mongoose connection error:', err.message);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
+  setTimeout(connectToMongoDB, 5000);
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('🔄 Mongoose reconnected to MongoDB');
+});
+
+// Connect to database
 connectToMongoDB();
 
 // Monitor connection events
