@@ -7,30 +7,65 @@ const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+// Import User model
+const User = require('./models/model');
 
+const app = express();
 app.use(cors({
   origin: '*', // For development only
   credentials: true
 }));
+app.use(bodyParser.json());
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => console.log('MongoDB Connected!'))
-  .catch(err => console.log('MongoDB connection error:', err));
+// Enhanced MongoDB connection
+async function connectToMongoDB() {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      bufferCommands: false,           // Disable buffering to get immediate errors
+      serverSelectionTimeoutMS: 5000, // Reduce timeout to 5 seconds
+      socketTimeoutMS: 45000,          // Socket timeout
+      maxPoolSize: 10,                 // Maintain up to 10 socket connections
+      connectTimeoutMS: 10000,         // Give up initial connection after 10 seconds
+      family: 4                        // Use IPv4, skip trying IPv6
+    });
+    console.log('✅ MongoDB Connected Successfully!');
+  } catch (error) {
+    console.error('❌ MongoDB Connection Error:', error.message);
+    console.log('🔄 Retrying connection in 5 seconds...');
+    setTimeout(connectToMongoDB, 5000);
+  }
+}
 
-// Mongoose User model
-const userSchema = new mongoose.Schema({
-  email:    { type: String, unique: true, required: true },
-  password: { type: String, required: true },
-  points:   { type: Number, default: 0 }
-}, { timestamps: true });
+// Connect before starting server
+connectToMongoDB();
 
-const User = mongoose.models.User || mongoose.model('User', userSchema);
+// Monitor connection events
+mongoose.connection.on('connected', () => {
+  console.log('✅ Mongoose connected to MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('❌ Mongoose connection error:', err.message);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
+  connectToMongoDB();
+});
+
+// Add middleware to check database connection before processing requests
+app.use((req, res, next) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(500).json({ 
+      message: 'Database connection unavailable',
+      readyState: mongoose.connection.readyState,
+      tip: 'Server is trying to reconnect to database'
+    });
+  }
+  next();
+});
 
 // JWT auth middleware
 function authenticateToken(req, res, next) {
@@ -51,7 +86,6 @@ function authenticateToken(req, res, next) {
 // Routes
 
 // Register
-// Register route with connection check
 app.post('/api/register', async (req, res) => {
   try {
     // Check if database is connected
@@ -79,22 +113,28 @@ app.post('/api/register', async (req, res) => {
     res.json({ token, message: 'User registered successfully' });
   } catch (error) {
     console.error('Register error:', error);
-    if (error.name === 'MongoTimeoutError') {
-      res.status(500).json({ message: 'Database operation timed out' });
-    } else {
-      res.status(500).json({ message: 'Server error', error: error.message });
+    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
+      return res.status(500).json({ message: 'Database operation timed out' });
     }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
 // Login
 app.post('/api/login', async (req, res) => {
   try {
+    // Check if database is connected
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(500).json({ 
+        message: 'Database connection unavailable' 
+      });
+    }
+
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ message: 'Missing email or password' });
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email }).maxTimeMS(5000);
     if (!user)
       return res.status(400).json({ message: 'User not found' });
 
@@ -105,6 +145,10 @@ app.post('/api/login', async (req, res) => {
     const token = jwt.sign({ id: user._id, email }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, message: 'Login successful' });
   } catch (error) {
+    console.error('Login error:', error);
+    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
+      return res.status(500).json({ message: 'Database operation timed out' });
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
@@ -112,10 +156,14 @@ app.post('/api/login', async (req, res) => {
 // Get profile
 app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id, '-password');
+    const user = await User.findById(req.user.id, '-password').maxTimeMS(5000);
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json(user);
   } catch (error) {
+    console.error('Profile error:', error);
+    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
+      return res.status(500).json({ message: 'Database operation timed out' });
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
@@ -127,13 +175,17 @@ app.post('/api/points', authenticateToken, async (req, res) => {
     if (typeof points !== 'number' || points < 0)
       return res.status(400).json({ message: 'Points must be a positive number' });
 
-    const user = await User.findById(req.user.id);
+    const user = await User.findById(req.user.id).maxTimeMS(5000);
     if (!user) return res.status(404).json({ message: 'User not found' });
     
     user.points += points;
     await user.save();
     res.json({ points: user.points, message: 'Points updated successfully' });
   } catch (error) {
+    console.error('Points error:', error);
+    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
+      return res.status(500).json({ message: 'Database operation timed out' });
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
