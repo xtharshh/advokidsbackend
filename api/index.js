@@ -3,223 +3,273 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const bodyParser = require('body-parser');
-const bcrypt = require('bcryptjs');  
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/model');
-const app = express();
-app.use(express.json());
-app.use(require('cors')({ origin: '*' }));
 
-// Disable mongoose command buffering globally
+const app = express();
+
+// Middleware
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+// Disable mongoose buffering
 mongoose.set('bufferCommands', false);
 
-// Enhanced MongoDB connection function (CORRECTED)
-async function connectToMongoDB() {
+// Enhanced connection caching for serverless
+let cachedConnection = null;
+
+async function connectToDatabase() {
+  // Return cached connection if available
+  if (cachedConnection && mongoose.connection.readyState === 1) {
+    console.log('♻️ Using cached MongoDB connection');
+    return cachedConnection;
+  }
+
   try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      
-      // Connection timeout settings
-      serverSelectionTimeoutMS: 5000,    // How long to try selecting a server
-      connectTimeoutMS: 10000,           // How long to wait for initial connection
-      socketTimeoutMS: 45000,            // How long a socket stays open
-      
-      // REMOVE these deprecated options that cause errors:
-      // bufferMaxEntries: 0,            // ❌ NOT SUPPORTED ANYMORE
-      // bufferCommands: false,          // ❌ Use mongoose.set() instead
-      
-      // Connection pool settings
-      maxPoolSize: 10,                   // Maximum connections
-      minPoolSize: 1,                    // Minimum connections
-      
-      // Retry settings
-      retryWrites: true,                 // Retry failed writes
-      family: 4                          // Use IPv4, skip IPv6
+    console.log('🔄 Creating new MongoDB connection...');
+    
+    const connection = await mongoose.connect(process.env.MONGODB_URI, {
+      // Remove deprecated options
+      maxPoolSize: 5,        // Reduced for serverless
+      minPoolSize: 1,
+      serverSelectionTimeoutMS: 5000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+      retryWrites: true,
+      family: 4
     });
     
+    cachedConnection = connection;
     console.log('✅ MongoDB Connected Successfully!');
+    return connection;
   } catch (error) {
     console.error('❌ MongoDB Connection Failed:', error.message);
-    
-    // Auto-retry connection after 5 seconds
-    console.log('🔄 Retrying connection in 5 seconds...');
-    setTimeout(connectToMongoDB, 5000);
+    cachedConnection = null;
+    throw error;
   }
 }
-
-// Rest of your connection event handlers...
-mongoose.connection.on('connected', () => {
-  console.log('✅ Mongoose connected to MongoDB');
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('❌ Mongoose connection error:', err.message);
-});
-
-mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
-  setTimeout(connectToMongoDB, 5000);
-});
-
-// Connect to database
-connectToMongoDB();
-
-// Monitor connection events
-mongoose.connection.on('connected', () => {
-  console.log('✅ Mongoose connected to MongoDB');
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('❌ Mongoose connection error:', err.message);
-});
-
-mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
-  connectToMongoDB();
-});
-
-// Add middleware to check database connection before processing requests
-app.use((req, res, next) => {
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(500).json({ 
-      message: 'Database connection unavailable',
-      readyState: mongoose.connection.readyState,
-      tip: 'Server is trying to reconnect to database'
-    });
-  }
-  next();
-});
 
 // JWT auth middleware
 function authenticateToken(req, res, next) {
-  const auth = req.headers['authorization'];
-  if (!auth) return res.status(401).json({ message: 'No token provided' });
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) {
+    return res.status(401).json({ message: 'No authorization header provided' });
+  }
   
-  const token = auth.split(' ')[1];
-  if (!token) return res.status(401).json({ message: 'Invalid token format' });
-  
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
-  } catch (error) {
-    return res.status(403).json({ message: 'Invalid or expired token' });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ message: 'Token expired' });
+    }
+    return res.status(403).json({ message: 'Invalid token' });
   }
 }
 
-// Routes
+// Async handler wrapper
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
 
-// Register
-app.post('/api/register', async (req, res) => {
-  try {
-    // Check if database is connected
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(500).json({ 
-        message: 'Database connection unavailable' 
-      });
-    }
+// Routes with connection handling
 
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Missing email or password' });
-    }
-
-    // Set a timeout for the database operation
-    const existingUser = await User.findOne({ email }).maxTimeMS(5000);
-    if (existingUser) {
-      return res.status(400).json({ message: 'User already exists' });
-    }
-
-    const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ email, password: hash });
-    const token = jwt.sign({ id: user._id, email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    
-    res.json({ token, message: 'User registered successfully' });
-  } catch (error) {
-    console.error('Register error:', error);
-    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
-      return res.status(500).json({ message: 'Database operation timed out' });
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'ADVO-KIDS API Ready', 
+    status: 'running',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Login
-app.post('/api/login', async (req, res) => {
+app.get('/health', asyncHandler(async (req, res) => {
   try {
-    // Check if database is connected
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(500).json({ 
-        message: 'Database connection unavailable' 
-      });
-    }
-
-    const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ message: 'Missing email or password' });
-
-    const user = await User.findOne({ email }).maxTimeMS(5000);
-    if (!user)
-      return res.status(400).json({ message: 'User not found' });
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match)
-      return res.status(401).json({ message: 'Invalid password' });
-
-    const token = jwt.sign({ id: user._id, email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, message: 'Login successful' });
+    await connectToDatabase();
+    res.json({ 
+      status: 'OK', 
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      mongooseState: mongoose.connection.readyState
+    });
   } catch (error) {
-    console.error('Login error:', error);
-    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
-      return res.status(500).json({ message: 'Database operation timed out' });
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ 
+      status: 'ERROR', 
+      timestamp: new Date().toISOString(),
+      database: 'disconnected',
+      error: error.message
+    });
   }
+}));
+
+app.post('/api/register', asyncHandler(async (req, res) => {
+  await connectToDatabase();
+
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
+  }
+
+  if (password.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ message: 'Invalid email format' });
+  }
+
+  const existingUser = await User.findOne({ email: email.toLowerCase() });
+  if (existingUser) {
+    return res.status(400).json({ message: 'User already exists' });
+  }
+
+  const hashedPassword = await bcrypt.hash(password, 12);
+  const user = new User({ 
+    email: email.toLowerCase(), 
+    password: hashedPassword 
+  });
+  await user.save();
+
+  const token = jwt.sign(
+    { id: user._id, email: user.email }, 
+    process.env.JWT_SECRET, 
+    { expiresIn: '7d' }
+  );
+
+  res.status(201).json({ 
+    token, 
+    message: 'User registered successfully',
+    user: { 
+      id: user._id, 
+      email: user.email, 
+      points: user.points 
+    }
+  });
+}));
+
+app.post('/api/login', asyncHandler(async (req, res) => {
+  await connectToDatabase();
+
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
+  }
+
+  const user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid email or password' });
+  }
+
+  const validPassword = await bcrypt.compare(password, user.password);
+  if (!validPassword) {
+    return res.status(401).json({ message: 'Invalid email or password' });
+  }
+
+  const token = jwt.sign(
+    { id: user._id, email: user.email }, 
+    process.env.JWT_SECRET, 
+    { expiresIn: '7d' }
+  );
+
+  res.json({ 
+    token, 
+    message: 'Login successful',
+    user: { 
+      id: user._id, 
+      email: user.email, 
+      points: user.points 
+    }
+  });
+}));
+
+app.get('/api/profile', authenticateToken, asyncHandler(async (req, res) => {
+  await connectToDatabase();
+
+  const user = await User.findById(req.user.id).select('-password');
+  if (!user) {
+    return res.status(404).json({ message: 'User not found' });
+  }
+  res.json(user);
+}));
+
+app.post('/api/points', authenticateToken, asyncHandler(async (req, res) => {
+  await connectToDatabase();
+
+  const { points } = req.body;
+  if (typeof points !== 'number' || points < 0) {
+    return res.status(400).json({ message: 'Points must be a positive number' });
+  }
+  if (points > 10000) {
+    return res.status(400).json({ message: 'Maximum 10,000 points can be added at once' });
+  }
+
+  const user = await User.findById(req.user.id);
+  if (!user) {
+    return res.status(404).json({ message: 'User not found' });
+  }
+
+  user.points += points;
+  await user.save();
+
+  res.json({ 
+    points: user.points, 
+    message: 'Points updated successfully', 
+    pointsAdded: points 
+  });
+}));
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Global Error:', err);
+  
+  if (err.code === 11000) {
+    return res.status(400).json({ message: 'Email already exists' });
+  }
+  
+  if (err.name === 'JsonWebTokenError') {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+  
+  if (err.name === 'TokenExpiredError') {
+    return res.status(401).json({ message: 'Token expired' });
+  }
+  
+  res.status(500).json({ 
+    message: 'Internal server error', 
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined 
+  });
 });
 
-// Get profile
-app.get('/api/profile', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id, '-password').maxTimeMS(5000);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    res.json(user);
-  } catch (error) {
-    console.error('Profile error:', error);
-    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
-      return res.status(500).json({ message: 'Database operation timed out' });
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
+// 404 handler
+app.use('/*path', (req, res) => {
+  res.status(404).json({ 
+    message: `Route ${req.originalUrl} not found`,
+    availableRoutes: [
+      'GET /',
+      'GET /health', 
+      'POST /api/register',
+      'POST /api/login',
+      'GET /api/profile',
+      'POST /api/points'
+    ]
+  });
 });
 
-// Add points
-app.post('/api/points', authenticateToken, async (req, res) => {
-  try {
-    const { points } = req.body;
-    if (typeof points !== 'number' || points < 0)
-      return res.status(400).json({ message: 'Points must be a positive number' });
-
-    const user = await User.findById(req.user.id).maxTimeMS(5000);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    
-    user.points += points;
-    await user.save();
-    res.json({ points: user.points, message: 'Points updated successfully' });
-  } catch (error) {
-    console.error('Points error:', error);
-    if (error.name === 'MongoTimeoutError' || error.message.includes('buffering timed out')) {
-      return res.status(500).json({ message: 'Database operation timed out' });
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Root
-app.get('/', (req, res) => res.json({ message: 'ADVO-KIDS API Ready', status: 'running' }));
-
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'OK', timestamp: new Date().toISOString() }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 API listening on port ${PORT}`));
+// Export for Vercel
+if (process.env.VERCEL) {
+  module.exports = app;
+} else {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`🚀 ADVO-KIDS API listening on port ${PORT}`);
+  });
+}
