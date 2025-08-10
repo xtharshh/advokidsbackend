@@ -1,5 +1,4 @@
 require('dotenv').config();
-
 const express = require('express');
 const mongoose = require('mongoose');
 const User = require('../models/model');
@@ -8,7 +7,10 @@ const app = express();
 app.use(express.json());
 app.use(require('cors')({ origin: '*' }));
 
-// Enhanced MongoDB connection function
+// Disable mongoose command buffering globally
+mongoose.set('bufferCommands', false);
+
+// Enhanced MongoDB connection function (CORRECTED)
 async function connectToMongoDB() {
   try {
     await mongoose.connect(process.env.MONGODB_URI, {
@@ -20,9 +22,9 @@ async function connectToMongoDB() {
       connectTimeoutMS: 10000,           // How long to wait for initial connection
       socketTimeoutMS: 45000,            // How long a socket stays open
       
-      // Buffer settings
-      bufferCommands: false,             // Disable buffering
-      bufferMaxEntries: 0,               // Disable mongoose buffering
+      // REMOVE these deprecated options that cause errors:
+      // bufferMaxEntries: 0,            // ❌ NOT SUPPORTED ANYMORE
+      // bufferCommands: false,          // ❌ Use mongoose.set() instead
       
       // Connection pool settings
       maxPoolSize: 10,                   // Maximum connections
@@ -43,7 +45,7 @@ async function connectToMongoDB() {
   }
 }
 
-// Enhanced connection event handlers
+// Rest of your connection event handlers...
 mongoose.connection.on('connected', () => {
   console.log('✅ Mongoose connected to MongoDB');
 });
@@ -55,10 +57,6 @@ mongoose.connection.on('error', (err) => {
 mongoose.connection.on('disconnected', () => {
   console.log('⚠️ MongoDB disconnected. Attempting to reconnect...');
   setTimeout(connectToMongoDB, 5000);
-});
-
-mongoose.connection.on('reconnected', () => {
-  console.log('🔄 Mongoose reconnected to MongoDB');
 });
 
 // Connect to database
